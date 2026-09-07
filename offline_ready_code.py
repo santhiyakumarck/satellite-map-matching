@@ -2132,7 +2132,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("TIMING")(pi5_env) tunga@tunga-desktop:~/pi5$ python3 ssm_major_code.py
+    print("TIMING")
 
 ======================================================================
 SATELLITE MAP MATCHING
