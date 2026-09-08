@@ -1,0 +1,2328 @@
+#!/usr/bin/env python3
+
+"""
+======================================================================
+OFFLINE SATELLITE MAP MATCHING
+SuperPoint + SuperGlue + RANSAC
+
+INPUTS:
+    1. Drone frames
+    2. GPS CSV
+    3. Frame timestamp CSV
+    4. Georeferenced satellite GeoTIFF
+
+FOR EACH FRAME:
+    Frame
+       |
+       +--> frame timestamp
+       |
+       +--> nearest GPS timestamp
+       |
+       +--> latitude / longitude / altitude
+       |
+       +--> calculate ground footprint using 90 deg FOV
+       |
+       +--> calculate satellite ROI
+       |
+       +--> SuperPoint
+       |
+       +--> SuperGlue
+       |
+       +--> RANSAC homography
+       |
+       +--> estimated satellite pixel
+       |
+       +--> estimated latitude / longitude
+
+OUTPUT:
+    results/
+        results.csv
+        visualizations/
+        rois/
+======================================================================
+"""
+
+
+# ======================================================================
+# IMPORTS
+# ======================================================================
+
+import os
+import re
+import csv
+import math
+import time
+import traceback
+
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.windows import Window
+from rasterio.transform import xy, rowcol
+
+import torch
+
+
+# ======================================================================
+# ONLY CHANGE THESE 4 INPUTS
+# ======================================================================
+
+FRAME_DIR = "/home/sandiya/sept 3-Drone-map-test/drone_data_20260903_144040/frames"
+
+GPS_CSV = "/home/sandiya/sept 3-Drone-map-test/drone_data_20260903_144040/gps.csv"
+
+FRAME_TIMESTAMP_CSV = "/home/sandiya/sept 3-Drone-map-test/drone_data_20260903_144040/frame_timestamps.csv"
+
+MAP_FILE = "/home/sandiya/Downloads/your_satellite_map.tif"
+
+
+# ======================================================================
+# GENERAL SETTINGS
+# ======================================================================
+
+# Camera field of view
+FOV_DEG = 90.0
+
+
+# Maximum number of frames to process.
+#
+# Use None for ALL frames.
+#
+# During testing, use for example:
+#
+# MAX_FRAMES = 20
+#
+MAX_FRAMES = None
+
+
+# Process every Nth frame.
+#
+# 1 = every frame
+# 2 = every second frame
+# 5 = every fifth frame
+#
+FRAME_STEP = 1
+
+
+# ======================================================================
+# ROI SETTINGS
+# ======================================================================
+
+# Extra margin around the calculated ground footprint.
+#
+# 1.5 means:
+#
+# calculated footprint x 1.5
+#
+ROI_MARGIN = 1.5
+
+
+# Minimum ROI size in meters.
+#
+# This prevents the ROI from becoming too small at low altitude.
+#
+MIN_ROI_METERS = 40.0
+
+
+# Maximum ROI size in meters.
+#
+# This prevents extremely large satellite crops.
+#
+MAX_ROI_METERS = 250.0
+
+
+# ======================================================================
+# SUPERPOINT / SUPERGLUE SETTINGS
+# ======================================================================
+
+SUPERGLUE_REPO = "/home/sandiya/santhiya_backup/superpoint_superglue/SuperGluePretrainedNetwork"
+
+SUPERPOINT_WEIGHTS = os.path.join(
+    SUPERGLUE_REPO,
+    "weights",
+    "superpoint_v1.pth"
+)
+
+SUPERGLUE_WEIGHTS = os.path.join(
+    SUPERGLUE_REPO,
+    "weights",
+    "superglue_outdoor.pth"
+)
+
+
+# SuperPoint maximum keypoints
+MAX_KEYPOINTS = 2048
+
+
+# SuperGlue confidence threshold
+MATCH_THRESHOLD = 0.20
+
+
+# ======================================================================
+# RANSAC SETTINGS
+# ======================================================================
+
+RANSAC_REPROJ_THRESHOLD = 5.0
+
+MIN_MATCHES_FOR_HOMOGRAPHY = 4
+
+MIN_RANSAC_INLIERS = 6
+
+
+# ======================================================================
+# OUTPUT
+# ======================================================================
+
+OUTPUT_DIR = "./map_matching_results"
+
+VIS_DIR = os.path.join(
+    OUTPUT_DIR,
+    "visualizations"
+)
+
+ROI_DIR = os.path.join(
+    OUTPUT_DIR,
+    "rois"
+)
+
+RESULT_CSV = os.path.join(
+    OUTPUT_DIR,
+    "results.csv"
+)
+
+
+# ======================================================================
+# CREATE OUTPUT DIRECTORIES
+# ======================================================================
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(VIS_DIR, exist_ok=True)
+os.makedirs(ROI_DIR, exist_ok=True)
+
+
+# ======================================================================
+# DEVICE
+# ======================================================================
+
+if torch.cuda.is_available():
+
+    DEVICE = torch.device("cuda")
+
+else:
+
+    DEVICE = torch.device("cpu")
+
+
+print()
+print("=" * 75)
+print("OFFLINE SATELLITE MAP MATCHING")
+print("=" * 75)
+
+print()
+print("Device:", DEVICE)
+
+if DEVICE.type == "cuda":
+
+    print("GPU:", torch.cuda.get_device_name(0))
+
+print()
+
+
+# ======================================================================
+# ADD SUPERGLUE REPOSITORY TO PYTHON PATH
+# ======================================================================
+
+import sys
+
+if SUPERGLUE_REPO not in sys.path:
+
+    sys.path.insert(0, SUPERGLUE_REPO)
+
+
+# ======================================================================
+# IMPORT SUPERPOINT / SUPERGLUE
+# ======================================================================
+
+try:
+
+    from models.matching import Matching
+
+    print("SuperPoint / SuperGlue imported successfully.")
+
+except Exception as e:
+
+    print()
+    print("ERROR: Could not import SuperPoint / SuperGlue.")
+    print()
+    print("Check SUPERGLUE_REPO:")
+    print(SUPERGLUE_REPO)
+    print()
+    raise e
+
+
+# ======================================================================
+# LOAD SUPERPOINT + SUPERGLUE
+# ======================================================================
+
+matching_config = {
+
+    "superpoint": {
+
+        "nms_radius": 4,
+
+        "keypoint_threshold": 0.005,
+
+        "max_keypoints": MAX_KEYPOINTS,
+
+    },
+
+    "superglue": {
+
+        "weights": "outdoor",
+
+        "sinkhorn_iterations": 20,
+
+        "match_threshold": MATCH_THRESHOLD,
+
+    }
+}
+
+
+print()
+print("Loading SuperPoint + SuperGlue...")
+
+matching = Matching(matching_config).eval().to(DEVICE)
+
+print("Models loaded successfully.")
+print()
+
+
+# ======================================================================
+# IMAGE TO TENSOR
+# ======================================================================
+
+def image_to_tensor(image):
+
+    """
+    Convert grayscale OpenCV image to SuperPoint tensor.
+    """
+
+    if image is None:
+
+        raise ValueError("Image is None.")
+
+    if len(image.shape) == 3:
+
+        gray = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2GRAY
+        )
+
+    else:
+
+        gray = image
+
+    tensor = torch.from_numpy(
+        gray.astype(np.float32) / 255.0
+    )
+
+    tensor = tensor.unsqueeze(0).unsqueeze(0)
+
+    return tensor.to(DEVICE)
+
+
+# ======================================================================
+# DETECT CSV COLUMN
+# ======================================================================
+
+def find_column(df, candidates):
+
+    """
+    Find a CSV column using several possible names.
+    """
+
+    # Exact match first
+
+    for candidate in candidates:
+
+        if candidate in df.columns:
+
+            return candidate
+
+
+    # Case-insensitive match
+
+    lower_columns = {
+
+        str(c).strip().lower(): c
+
+        for c in df.columns
+
+    }
+
+
+    for candidate in candidates:
+
+        key = candidate.strip().lower()
+
+        if key in lower_columns:
+
+            return lower_columns[key]
+
+
+    # Partial match
+
+    for col in df.columns:
+
+        col_lower = str(col).strip().lower()
+
+        for candidate in candidates:
+
+            if candidate.lower() in col_lower:
+
+                return col
+
+
+    return None
+
+
+# ======================================================================
+# LOAD GPS CSV
+# ======================================================================
+
+print("=" * 75)
+print("LOADING GPS CSV")
+print("=" * 75)
+
+gps_df = pd.read_csv(GPS_CSV)
+
+print()
+print("GPS columns:")
+print(list(gps_df.columns))
+print()
+
+
+# ----------------------------------------------------------------------
+# Find GPS timestamp
+# ----------------------------------------------------------------------
+
+gps_timestamp_col = find_column(
+    gps_df,
+    [
+        "timestamp_ns",
+        "gps_timestamp_ns",
+        "bag_timestamp",
+        "timestamp",
+        "time_ns",
+        "gps_timestamp",
+    ]
+)
+
+
+# ----------------------------------------------------------------------
+# Find latitude
+# ----------------------------------------------------------------------
+
+lat_col = find_column(
+    gps_df,
+    [
+        "latitude",
+        "lat",
+        "Latitude",
+        "LAT"
+    ]
+)
+
+
+# ----------------------------------------------------------------------
+# Find longitude
+# ----------------------------------------------------------------------
+
+lon_col = find_column(
+    gps_df,
+    [
+        "longitude",
+        "lon",
+        "lng",
+        "Longitude",
+        "LON"
+    ]
+)
+
+
+# ----------------------------------------------------------------------
+# Find altitude
+# ----------------------------------------------------------------------
+
+alt_col = find_column(
+    gps_df,
+    [
+        "altitude",
+        "alt",
+        "height",
+        "Altitude",
+        "ALT"
+    ]
+)
+
+
+if gps_timestamp_col is None:
+
+    raise RuntimeError(
+        "Could not find GPS timestamp column."
+    )
+
+
+if lat_col is None:
+
+    raise RuntimeError(
+        "Could not find latitude column."
+    )
+
+
+if lon_col is None:
+
+    raise RuntimeError(
+        "Could not find longitude column."
+    )
+
+
+if alt_col is None:
+
+    raise RuntimeError(
+        "Could not find altitude column."
+    )
+
+
+print("GPS timestamp column :", gps_timestamp_col)
+print("Latitude column       :", lat_col)
+print("Longitude column      :", lon_col)
+print("Altitude column       :", alt_col)
+
+
+# ======================================================================
+# NORMALIZE GPS TIMESTAMP
+# ======================================================================
+
+gps_time = pd.to_numeric(
+    gps_df[gps_timestamp_col],
+    errors="coerce"
+)
+
+gps_df["_timestamp_ns"] = gps_time
+
+
+gps_df = gps_df.dropna(
+    subset=[
+        "_timestamp_ns",
+        lat_col,
+        lon_col,
+        alt_col
+    ]
+).copy()
+
+
+gps_df["_timestamp_ns"] = gps_df[
+    "_timestamp_ns"
+].astype(np.int64)
+
+
+gps_df = gps_df.sort_values(
+    "_timestamp_ns"
+).reset_index(drop=True)
+
+
+gps_timestamps = gps_df[
+    "_timestamp_ns"
+].to_numpy(
+    dtype=np.int64
+)
+
+
+# ======================================================================
+# LOAD FRAME TIMESTAMP CSV
+# ======================================================================
+
+print()
+print("=" * 75)
+print("LOADING FRAME TIMESTAMPS")
+print("=" * 75)
+
+frame_ts_df = pd.read_csv(
+    FRAME_TIMESTAMP_CSV
+)
+
+print()
+print("Frame timestamp columns:")
+print(list(frame_ts_df.columns))
+print()
+
+
+frame_timestamp_col = find_column(
+    frame_ts_df,
+    [
+        "timestamp_ns",
+        "frame_timestamp_ns",
+        "bag_timestamp",
+        "timestamp"
+    ]
+)
+
+
+frame_filename_col = find_column(
+    frame_ts_df,
+    [
+        "frame_filename",
+        "filename",
+        "frame_file",
+        "file"
+    ]
+)
+
+
+frame_id_col = find_column(
+    frame_ts_df,
+    [
+        "frame_id",
+        "id"
+    ]
+)
+
+
+if frame_timestamp_col is None:
+
+    raise RuntimeError(
+        "Could not find frame timestamp column."
+    )
+
+
+if frame_filename_col is None:
+
+    raise RuntimeError(
+        "Could not find frame filename column."
+    )
+
+
+print(
+    "Frame timestamp column:",
+    frame_timestamp_col
+)
+
+print(
+    "Frame filename column :",
+    frame_filename_col
+)
+
+
+# ======================================================================
+# MAP INFORMATION
+# ======================================================================
+
+print()
+print("=" * 75)
+print("OPENING SATELLITE MAP")
+print("=" * 75)
+
+src = rasterio.open(MAP_FILE)
+
+print()
+print("Map:", MAP_FILE)
+print("Width :", src.width)
+print("Height:", src.height)
+print("Bands :", src.count)
+print("CRS   :", src.crs)
+print("Bounds:", src.bounds)
+print()
+
+
+if src.crs is None:
+
+    raise RuntimeError(
+        "Satellite map has no CRS."
+    )
+
+
+# ======================================================================
+# LAT/LON -> MAP PIXEL
+# ======================================================================
+
+def latlon_to_pixel(lat, lon):
+
+    """
+    Convert geographic coordinates to GeoTIFF pixel coordinates.
+    """
+
+    row, col = rowcol(
+        src.transform,
+        lon,
+        lat
+    )
+
+    return float(col), float(row)
+
+
+# ======================================================================
+# MAP PIXEL -> LAT/LON
+# ======================================================================
+
+def pixel_to_latlon(x, y):
+
+    """
+    Convert satellite pixel coordinates to longitude/latitude.
+    """
+
+    lon, lat = xy(
+        src.transform,
+        y,
+        x,
+        offset="center"
+    )
+
+    return float(lat), float(lon)
+
+
+# ======================================================================
+# ESTIMATE GROUND FOOTPRINT
+# ======================================================================
+
+def calculate_ground_footprint(
+    altitude_m,
+    fov_deg=FOV_DEG
+):
+
+    """
+    Estimate ground footprint assuming a nadir camera.
+
+    For a square 90-degree FOV:
+
+        footprint = 2 * altitude * tan(FOV/2)
+    """
+
+    altitude_m = abs(float(altitude_m))
+
+
+    if altitude_m <= 0:
+
+        return MIN_ROI_METERS
+
+
+    half_angle = math.radians(
+        fov_deg / 2.0
+    )
+
+
+    footprint = (
+
+        2.0
+        * altitude_m
+        * math.tan(half_angle)
+
+    )
+
+
+    footprint *= ROI_MARGIN
+
+
+    footprint = max(
+        footprint,
+        MIN_ROI_METERS
+    )
+
+
+    footprint = min(
+        footprint,
+        MAX_ROI_METERS
+    )
+
+
+    return footprint
+
+
+# ======================================================================
+# METERS -> MAP PIXELS
+# ======================================================================
+
+def meters_per_pixel():
+
+    """
+    Estimate map resolution in meters/pixel.
+
+    Works for geographic CRS maps by converting
+    longitude/latitude distance near the map center.
+    """
+
+    center_row = src.height / 2.0
+    center_col = src.width / 2.0
+
+
+    lon1, lat1 = xy(
+        src.transform,
+        center_row,
+        center_col,
+        offset="center"
+    )
+
+
+    lon2, lat2 = xy(
+        src.transform,
+        center_row,
+        center_col + 1,
+        offset="center"
+    )
+
+
+    lat_rad = math.radians(lat1)
+
+
+    meters_lon = (
+
+        (lon2 - lon1)
+        * 111320.0
+        * math.cos(lat_rad)
+
+    )
+
+
+    meters_lat = abs(
+
+        (lat2 - lat1)
+        * 110540.0
+
+    )
+
+
+    mx = abs(meters_lon)
+    my = abs(meters_lat)
+
+
+    if mx <= 0:
+
+        mx = 1.0
+
+
+    if my <= 0:
+
+        my = 1.0
+
+
+    return mx, my
+
+
+MAP_M_PER_PIXEL_X, MAP_M_PER_PIXEL_Y = meters_per_pixel()
+
+
+print(
+    "Approx map resolution:",
+    MAP_M_PER_PIXEL_X,
+    "m/pixel X"
+)
+
+print(
+    "Approx map resolution:",
+    MAP_M_PER_PIXEL_Y,
+    "m/pixel Y"
+)
+
+print()
+
+
+# ======================================================================
+# CREATE AUTOMATIC ROI
+# ======================================================================
+
+def create_satellite_roi(
+    lat,
+    lon,
+    altitude,
+    frame_id
+):
+
+    """
+    Create satellite ROI around the GPS/INS position.
+
+    ROI size is automatically calculated from altitude
+    and the 90-degree camera FOV.
+    """
+
+    center_x, center_y = latlon_to_pixel(
+        lat,
+        lon
+    )
+
+
+    footprint_m = calculate_ground_footprint(
+        altitude
+    )
+
+
+    roi_width_px = int(
+        footprint_m /
+        MAP_M_PER_PIXEL_X
+    )
+
+
+    roi_height_px = int(
+        footprint_m /
+        MAP_M_PER_PIXEL_Y
+    )
+
+
+    # Safety minimum
+
+    roi_width_px = max(
+        roi_width_px,
+        32
+    )
+
+    roi_height_px = max(
+        roi_height_px,
+        32
+    )
+
+
+    # Calculate window
+
+    x0 = int(
+        round(
+            center_x
+            - roi_width_px / 2
+        )
+    )
+
+
+    y0 = int(
+        round(
+            center_y
+            - roi_height_px / 2
+        )
+    )
+
+
+    # Clip to map boundaries
+
+    x0 = max(
+        0,
+        x0
+    )
+
+    y0 = max(
+        0,
+        y0
+    )
+
+
+    x1 = min(
+        src.width,
+        x0 + roi_width_px
+    )
+
+    y1 = min(
+        src.height,
+        y0 + roi_height_px
+    )
+
+
+    width = x1 - x0
+    height = y1 - y0
+
+
+    if width <= 10 or height <= 10:
+
+        return None
+
+
+    window = Window(
+        x0,
+        y0,
+        width,
+        height
+    )
+
+
+    # Read RGB
+
+    if src.count >= 3:
+
+        satellite = src.read(
+            [1, 2, 3],
+            window=window
+        )
+
+        satellite = np.transpose(
+            satellite,
+            (1, 2, 0)
+        )
+
+
+    else:
+
+        gray = src.read(
+            1,
+            window=window
+        )
+
+        satellite = cv2.cvtColor(
+            gray,
+            cv2.COLOR_GRAY2BGR
+        )
+
+
+    # Convert to uint8
+
+    if satellite.dtype != np.uint8:
+
+        satellite = cv2.normalize(
+            satellite,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX
+        ).astype(np.uint8)
+
+
+    roi_path = os.path.join(
+        ROI_DIR,
+        f"roi_{frame_id:05d}.jpg"
+    )
+
+
+    cv2.imwrite(
+        roi_path,
+        cv2.cvtColor(
+            satellite,
+            cv2.COLOR_RGB2BGR
+        )
+    )
+
+
+    return {
+
+        "image": satellite,
+
+        "x0": x0,
+
+        "y0": y0,
+
+        "width": width,
+
+        "height": height,
+
+        "center_x": center_x,
+
+        "center_y": center_y,
+
+        "footprint_m": footprint_m,
+
+        "roi_path": roi_path
+
+    }
+
+
+# ======================================================================
+# SUPERPOINT + SUPERGLUE MATCH
+# ======================================================================
+
+def run_superpoint_superglue(
+    drone_image,
+    satellite_image
+):
+
+    """
+    Run SuperPoint + SuperGlue.
+    """
+
+    image0 = image_to_tensor(
+        drone_image
+    )
+
+    image1 = image_to_tensor(
+        satellite_image
+    )
+
+
+    with torch.no_grad():
+
+        prediction = matching({
+
+            "image0": image0,
+
+            "image1": image1
+
+        })
+
+
+    keypoints0 = (
+
+        prediction["keypoints0"][0]
+        .detach()
+        .cpu()
+        .numpy()
+
+    )
+
+
+    keypoints1 = (
+
+        prediction["keypoints1"][0]
+        .detach()
+        .cpu()
+        .numpy()
+
+    )
+
+
+    matches0 = (
+
+        prediction["matches0"][0]
+        .detach()
+        .cpu()
+        .numpy()
+
+    )
+
+
+    confidence = (
+
+        prediction["matching_scores0"][0]
+        .detach()
+        .cpu()
+        .numpy()
+
+    )
+
+
+    valid = (
+
+        matches0 > -1
+    )
+
+
+    mkpts0 = keypoints0[
+        valid
+    ]
+
+
+    mkpts1 = keypoints1[
+        matches0[valid]
+    ]
+
+
+    mconf = confidence[
+        valid
+    ]
+
+
+    return (
+        mkpts0,
+        mkpts1,
+        mconf
+    )
+
+
+# ======================================================================
+# RANSAC HOMOGRAPHY
+# ======================================================================
+
+def calculate_homography(
+    mkpts0,
+    mkpts1
+):
+
+    """
+    Estimate drone -> satellite homography.
+    """
+
+    if len(mkpts0) < MIN_MATCHES_FOR_HOMOGRAPHY:
+
+        return None, None
+
+
+    H, mask = cv2.findHomography(
+
+        mkpts0,
+
+        mkpts1,
+
+        cv2.RANSAC,
+
+        RANSAC_REPROJ_THRESHOLD
+
+    )
+
+
+    if H is None or mask is None:
+
+        return None, None
+
+
+    inlier_mask = mask.ravel().astype(bool)
+
+
+    return H, inlier_mask
+
+
+# ======================================================================
+# ESTIMATE DRONE CENTER IN SATELLITE ROI
+# ======================================================================
+
+def estimate_satellite_position(
+    H,
+    drone_image_shape
+):
+
+    """
+    Project the center of the drone image into
+    the satellite ROI using the homography.
+    """
+
+    h, w = drone_image_shape[:2]
+
+
+    center = np.array(
+        [
+            [
+                [
+                    w / 2.0,
+                    h / 2.0
+                ]
+            ]
+        ],
+        dtype=np.float32
+    )
+
+
+    projected = cv2.perspectiveTransform(
+        center,
+        H
+    )
+
+
+    x = float(
+        projected[0, 0, 0]
+    )
+
+    y = float(
+        projected[0, 0, 1]
+    )
+
+
+    return x, y
+
+
+# ======================================================================
+# VISUALIZE MATCHES
+# ======================================================================
+
+def draw_matching_visualization(
+
+    drone,
+
+    satellite,
+
+    mkpts0,
+
+    mkpts1,
+
+    inlier_mask,
+
+    estimated_x,
+
+    estimated_y,
+
+    frame_id
+
+):
+
+    """
+    Draw matching result.
+    """
+
+    drone_vis = drone.copy()
+
+    satellite_vis = satellite.copy()
+
+
+    if len(drone_vis.shape) == 2:
+
+        drone_vis = cv2.cvtColor(
+            drone_vis,
+            cv2.COLOR_GRAY2BGR
+        )
+
+
+    if len(satellite_vis.shape) == 2:
+
+        satellite_vis = cv2.cvtColor(
+            satellite_vis,
+            cv2.COLOR_GRAY2BGR
+        )
+
+
+    # Draw matches
+
+    for i in range(
+        len(mkpts0)
+    ):
+
+        p0 = tuple(
+            np.round(
+                mkpts0[i]
+            ).astype(int)
+        )
+
+        p1 = tuple(
+            np.round(
+                mkpts1[i]
+            ).astype(int)
+        )
+
+
+        if (
+
+            inlier_mask is not None
+            and i < len(inlier_mask)
+            and inlier_mask[i]
+
+        ):
+
+            line_color = (0, 255, 0)
+
+        else:
+
+            line_color = (0, 0, 255)
+
+
+        cv2.circle(
+            drone_vis,
+            p0,
+            3,
+            line_color,
+            -1
+        )
+
+
+        cv2.circle(
+            satellite_vis,
+            p1,
+            3,
+            line_color,
+            -1
+        )
+
+
+    # Estimated position
+
+    if (
+
+        0 <= estimated_x < satellite_vis.shape[1]
+        and
+        0 <= estimated_y < satellite_vis.shape[0]
+
+    ):
+
+        cv2.drawMarker(
+
+            satellite_vis,
+
+            (
+                int(estimated_x),
+                int(estimated_y)
+            ),
+
+            (255, 0, 255),
+
+            cv2.MARKER_CROSS,
+
+            30,
+
+            3
+
+        )
+
+
+    # Resize images to same height
+
+    target_height = max(
+
+        drone_vis.shape[0],
+
+        satellite_vis.shape[0]
+
+    )
+
+
+    def resize_height(image):
+
+        scale = (
+            target_height
+            / image.shape[0]
+        )
+
+        return cv2.resize(
+
+            image,
+
+            None,
+
+            fx=scale,
+
+            fy=scale,
+
+            interpolation=cv2.INTER_AREA
+
+        )
+
+
+    drone_vis = resize_height(
+        drone_vis
+    )
+
+    satellite_vis = resize_height(
+        satellite_vis
+    )
+
+
+    combined = np.hstack(
+        [
+            drone_vis,
+            satellite_vis
+        ]
+    )
+
+
+    path = os.path.join(
+
+        VIS_DIR,
+
+        f"match_{frame_id:05d}.jpg"
+
+    )
+
+
+    cv2.imwrite(
+        path,
+        combined
+    )
+
+
+    return path
+
+
+# ======================================================================
+# FIND NEAREST GPS
+# ======================================================================
+
+def find_nearest_gps(
+    timestamp_ns
+):
+
+    """
+    Find GPS row with nearest timestamp.
+    """
+
+    idx = np.searchsorted(
+        gps_timestamps,
+        timestamp_ns
+    )
+
+
+    if idx == 0:
+
+        nearest_idx = 0
+
+
+    elif idx >= len(gps_timestamps):
+
+        nearest_idx = len(
+            gps_timestamps
+        ) - 1
+
+
+    else:
+
+        before = idx - 1
+        after = idx
+
+
+        diff_before = abs(
+            timestamp_ns
+            - gps_timestamps[before]
+        )
+
+
+        diff_after = abs(
+            timestamp_ns
+            - gps_timestamps[after]
+        )
+
+
+        if diff_before <= diff_after:
+
+            nearest_idx = before
+
+        else:
+
+            nearest_idx = after
+
+
+    row = gps_df.iloc[
+        nearest_idx
+    ]
+
+
+    gps_timestamp = int(
+        row["_timestamp_ns"]
+    )
+
+
+    difference_ms = (
+
+        abs(
+            timestamp_ns
+            - gps_timestamp
+        )
+        / 1_000_000.0
+
+    )
+
+
+    lat = float(
+        row[lat_col]
+    )
+
+    lon = float(
+        row[lon_col]
+    )
+
+    altitude = float(
+        row[alt_col]
+    )
+
+
+    return (
+
+        lat,
+
+        lon,
+
+        altitude,
+
+        gps_timestamp,
+
+        difference_ms
+
+    )
+
+
+# ======================================================================
+# LOAD FRAME LIST
+# ======================================================================
+
+frame_files = sorted(
+
+    [
+
+        f for f in os.listdir(
+            FRAME_DIR
+        )
+
+        if f.lower().endswith(
+            (
+                ".jpg",
+                ".jpeg",
+                ".png"
+            )
+        )
+
+    ]
+
+)
+
+
+print()
+print("=" * 75)
+print("FRAME INFORMATION")
+print("=" * 75)
+
+print(
+    "Frames found:",
+    len(frame_files)
+)
+
+print()
+
+
+# ======================================================================
+# MAIN PROCESSING
+# ======================================================================
+
+results = []
+
+
+processed = 0
+
+successful = 0
+
+
+for _, ts_row in frame_ts_df.iterrows():
+
+    # ---------------------------------------------------------------
+    # Stop after MAX_FRAMES
+    # ---------------------------------------------------------------
+
+    if (
+
+        MAX_FRAMES is not None
+        and
+        processed >= MAX_FRAMES
+
+    ):
+
+        break
+
+
+    frame_id = int(
+        ts_row[frame_id_col]
+    ) if frame_id_col is not None else processed
+
+
+    # ---------------------------------------------------------------
+    # Frame step
+    # ---------------------------------------------------------------
+
+    if frame_id % FRAME_STEP != 0:
+
+        continue
+
+
+    frame_filename = str(
+        ts_row[frame_filename_col]
+    )
+
+
+    frame_path = os.path.join(
+
+        FRAME_DIR,
+
+        frame_filename
+
+    )
+
+
+    if not os.path.exists(
+        frame_path
+    ):
+
+        print(
+            "WARNING: Frame not found:",
+            frame_path
+        )
+
+        continue
+
+
+    timestamp_ns = int(
+        ts_row[frame_timestamp_col]
+    )
+
+
+    # ---------------------------------------------------------------
+    # Start total timer
+    # ---------------------------------------------------------------
+
+    total_start = time.perf_counter()
+
+
+    try:
+
+        print()
+        print("-" * 75)
+
+        print(
+            f"FRAME {frame_id}: {frame_filename}"
+        )
+
+
+        # ============================================================
+        # LOAD DRONE FRAME
+        # ============================================================
+
+        drone_image = cv2.imread(
+            frame_path
+        )
+
+
+        if drone_image is None:
+
+            raise RuntimeError(
+                "Could not read drone image."
+            )
+
+
+        # ============================================================
+        # FIND GPS
+        # ============================================================
+
+        (
+
+            gps_lat,
+
+            gps_lon,
+
+            gps_alt,
+
+            gps_timestamp,
+
+            gps_time_diff_ms
+
+        ) = find_nearest_gps(
+            timestamp_ns
+        )
+
+
+        print(
+            f"GPS: {gps_lat:.8f}, "
+            f"{gps_lon:.8f}, "
+            f"alt={gps_alt:.3f} m"
+        )
+
+
+        print(
+            f"Frame-GPS time difference: "
+            f"{gps_time_diff_ms:.3f} ms"
+        )
+
+
+        # ============================================================
+        # CREATE DYNAMIC SATELLITE ROI
+        # ============================================================
+
+        roi_start = time.perf_counter()
+
+
+        roi = create_satellite_roi(
+
+            gps_lat,
+
+            gps_lon,
+
+            gps_alt,
+
+            frame_id
+
+        )
+
+
+        roi_time = (
+
+            time.perf_counter()
+            - roi_start
+
+        )
+
+
+        if roi is None:
+
+            raise RuntimeError(
+                "Could not create satellite ROI."
+            )
+
+
+        satellite_image = roi[
+            "image"
+        ]
+
+
+        print(
+            f"ROI: "
+            f"{roi['width']} x "
+            f"{roi['height']} pixels"
+        )
+
+
+        print(
+            f"Estimated ground footprint: "
+            f"{roi['footprint_m']:.2f} m"
+        )
+
+
+        # ============================================================
+        # SUPERPOINT + SUPERGLUE
+        # ============================================================
+
+        matching_start = time.perf_counter()
+
+
+        (
+
+            mkpts0,
+
+            mkpts1,
+
+            mconf
+
+        ) = run_superpoint_superglue(
+
+            drone_image,
+
+            satellite_image
+
+        )
+
+
+        matching_time = (
+
+            time.perf_counter()
+            - matching_start
+
+        )
+
+
+        total_matches = len(
+            mkpts0
+        )
+
+
+        print(
+            "SuperGlue matches:",
+            total_matches
+        )
+
+
+        # ============================================================
+        # RANSAC
+        # ============================================================
+
+        ransac_start = time.perf_counter()
+
+
+        H, inlier_mask = calculate_homography(
+
+            mkpts0,
+
+            mkpts1
+
+        )
+
+
+        ransac_time = (
+
+            time.perf_counter()
+            - ransac_start
+
+        )
+
+
+        # Defaults
+
+        inliers = 0
+
+        inlier_ratio = 0.0
+
+        estimated_x = np.nan
+
+        estimated_y = np.nan
+
+        estimated_lat = np.nan
+
+        estimated_lon = np.nan
+
+        position_error_m = np.nan
+
+        status = "FAILED"
+
+
+        # ============================================================
+        # HOMOGRAPHY SUCCESS
+        # ============================================================
+
+        if H is not None:
+
+            inliers = int(
+                np.sum(
+                    inlier_mask
+                )
+            )
+
+
+            if total_matches > 0:
+
+                inlier_ratio = (
+
+                    inliers
+                    / total_matches
+
+                )
+
+
+            print(
+                "RANSAC inliers:",
+                inliers
+            )
+
+
+            print(
+                "Inlier ratio:",
+                f"{inlier_ratio:.3f}"
+            )
+
+
+            # --------------------------------------------------------
+            # Estimate center position
+            # --------------------------------------------------------
+
+            (
+
+                estimated_x,
+
+                estimated_y
+
+            ) = estimate_satellite_position(
+
+                H,
+
+                drone_image.shape
+
+            )
+
+
+            # --------------------------------------------------------
+            # Convert ROI pixel -> full map pixel
+            # --------------------------------------------------------
+
+            map_x = (
+
+                roi["x0"]
+                + estimated_x
+
+            )
+
+
+            map_y = (
+
+                roi["y0"]
+                + estimated_y
+
+            )
+
+
+            # --------------------------------------------------------
+            # Convert pixel -> lat/lon
+            # --------------------------------------------------------
+
+            (
+
+                estimated_lat,
+
+                estimated_lon
+
+            ) = pixel_to_latlon(
+
+                map_x,
+
+                map_y
+
+            )
+
+
+            # --------------------------------------------------------
+            # Calculate geographic error
+            # --------------------------------------------------------
+
+            def haversine(
+
+                lat1,
+
+                lon1,
+
+                lat2,
+
+                lon2
+
+            ):
+
+                R = 6371000.0
+
+
+                p1 = math.radians(
+                    lat1
+                )
+
+                p2 = math.radians(
+                    lat2
+                )
+
+
+                dp = math.radians(
+                    lat2 - lat1
+                )
+
+                dl = math.radians(
+                    lon2 - lon1
+                )
+
+
+                a = (
+
+                    math.sin(dp / 2) ** 2
+
+                    +
+
+                    math.cos(p1)
+                    * math.cos(p2)
+                    * math.sin(dl / 2) ** 2
+
+                )
+
+
+                return (
+
+                    2
+                    * R
+                    * math.asin(
+                        math.sqrt(a)
+                    )
+
+                )
+
+
+            position_error_m = haversine(
+
+                gps_lat,
+
+                gps_lon,
+
+                estimated_lat,
+
+                estimated_lon
+
+            )
+
+
+            if inliers >= MIN_RANSAC_INLIERS:
+
+                status = "SUCCESS"
+
+                successful += 1
+
+            else:
+
+                status = "LOW_INLIERS"
+
+
+            print()
+            print(
+                "Estimated position:"
+            )
+
+            print(
+                f"Latitude  : "
+                f"{estimated_lat:.8f}"
+            )
+
+            print(
+                f"Longitude : "
+                f"{estimated_lon:.8f}"
+            )
+
+            print(
+                f"Error     : "
+                f"{position_error_m:.3f} m"
+            )
+
+
+        else:
+
+            print(
+                "RANSAC failed."
+            )
+
+
+        # ============================================================
+        # VISUALIZATION
+        # ============================================================
+
+        visualization_path = ""
+
+
+        if H is not None:
+
+            visualization_path = (
+
+                draw_matching_visualization(
+
+                    drone_image,
+
+                    satellite_image,
+
+                    mkpts0,
+
+                    mkpts1,
+
+                    inlier_mask,
+
+                    estimated_x,
+
+                    estimated_y,
+
+                    frame_id
+
+                )
+
+            )
+
+
+        # ============================================================
+        # TOTAL TIME
+        # ============================================================
+
+        total_time = (
+
+            time.perf_counter()
+            - total_start
+
+        )
+
+
+        print()
+        print(
+            f"ROI time      : "
+            f"{roi_time * 1000:.2f} ms"
+        )
+
+        print(
+            f"Matching time : "
+            f"{matching_time * 1000:.2f} ms"
+        )
+
+        print(
+            f"RANSAC time   : "
+            f"{ransac_time * 1000:.2f} ms"
+        )
+
+        print(
+            f"TOTAL time    : "
+            f"{total_time * 1000:.2f} ms"
+        )
+
+        print(
+            "STATUS        :",
+            status
+        )
+
+
+        # ============================================================
+        # SAVE RESULT
+        # ============================================================
+
+        results.append({
+
+            "frame_id":
+                frame_id,
+
+            "frame_filename":
+                frame_filename,
+
+            "frame_timestamp_ns":
+                timestamp_ns,
+
+            "gps_timestamp_ns":
+                gps_timestamp,
+
+            "frame_gps_difference_ms":
+                gps_time_diff_ms,
+
+            "gps_latitude":
+                gps_lat,
+
+            "gps_longitude":
+                gps_lon,
+
+            "gps_altitude_m":
+                gps_alt,
+
+            "fov_deg":
+                FOV_DEG,
+
+            "roi_width_px":
+                roi["width"],
+
+            "roi_height_px":
+                roi["height"],
+
+            "roi_footprint_m":
+                roi["footprint_m"],
+
+            "superglue_matches":
+                total_matches,
+
+            "ransac_inliers":
+                inliers,
+
+            "inlier_ratio":
+                inlier_ratio,
+
+            "estimated_latitude":
+                estimated_lat,
+
+            "estimated_longitude":
+                estimated_lon,
+
+            "position_error_m":
+                position_error_m,
+
+            "roi_time_ms":
+                roi_time * 1000,
+
+            "matching_time_ms":
+                matching_time * 1000,
+
+            "ransac_time_ms":
+                ransac_time * 1000,
+
+            "total_processing_time_ms":
+                total_time * 1000,
+
+            "status":
+                status,
+
+            "visualization":
+                visualization_path
+
+        })
+
+
+    except Exception as e:
+
+        print()
+        print(
+            "ERROR processing frame:",
+            frame_id
+        )
+
+        print(
+            str(e)
+        )
+
+        traceback.print_exc()
+
+
+        results.append({
+
+            "frame_id":
+                frame_id,
+
+            "frame_filename":
+                frame_filename,
+
+            "frame_timestamp_ns":
+                timestamp_ns,
+
+            "status":
+                "ERROR",
+
+            "error_message":
+                str(e)
+
+        })
+
+
+    processed += 1
+
+
+# ======================================================================
+# SAVE RESULTS
+# ======================================================================
+
+results_df = pd.DataFrame(
+    results
+)
+
+
+results_df.to_csv(
+    RESULT_CSV,
+    index=False
+)
+
+
+# ======================================================================
+# FINAL SUMMARY
+# ======================================================================
+
+print()
+print()
+print("=" * 75)
+print("MAP MATCHING COMPLETE")
+print("=" * 75)
+
+print()
+
+print(
+    "Frames processed:",
+    processed
+)
+
+print(
+    "Successful matches:",
+    successful
+)
+
+if processed > 0:
+
+    success_rate = (
+
+        successful
+        / processed
+        * 100.0
+
+    )
+
+    print(
+        f"Success rate: "
+        f"{success_rate:.2f}%"
+    )
+
+
+print()
+
+print(
+    "Results CSV:"
+)
+
+print(
+    RESULT_CSV
+)
+
+print()
+
+print(
+    "Visualizations:"
+)
+
+print(
+    VIS_DIR
+)
+
+print()
+
+print(
+    "ROIs:"
+)
+
+print(
+    ROI_DIR
+)
+
+print()
+
+print("=" * 75)
+
+
+# ======================================================================
+# CLOSE MAP
+# ======================================================================
+
+src.close()
