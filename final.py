@@ -10,6 +10,9 @@ import pandas as pd
 import rasterio
 from rasterio.transform import rowcol, xy
 
+import sys
+sys.path.insert(0, "/home/sandiya/sept 3-Drone-map-test/SuperGluePretrainedNetwork")
+
 import torch
 
 from models.matching import Matching
